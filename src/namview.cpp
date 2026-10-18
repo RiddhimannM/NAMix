@@ -20,9 +20,11 @@
 #include "namids.h"
 #include "platform/respath.h"
 
+#include "pluginterfaces/base/keycodes.h"
 #include "pluginterfaces/base/ustring.h"
 
 #include <algorithm>
+#include <charconv>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -43,8 +45,26 @@ namespace fs = std::filesystem;
 
 namespace
 {
-constexpr float kKnobDragRange = 200.0f; // pixels of vertical drag for full range
+// Drag and wheel gearing, from the original plug-in's knobs (iPlug2's
+// IKnobControlBase). A drag covers the full range in DEFAULT_GEARING (4.0)
+// heights of the knob's drag bounds; the face diameter stands in for those
+// bounds here, which upstream derives from its own label/knob/value layout.
+// Holding Shift or Ctrl makes a drag ten times finer and a wheel notch a
+// tenth of its usual 1% (IsFineControl: "mod.C || mod.S").
+constexpr float kDragGearing = 4.0f;
+constexpr float kFineDragFactor = 10.0f;
+constexpr double kWheelStep = 0.01, kFineWheelStep = 0.001;
+// The dBu box has no wheel in the original (it is a text field there), so its
+// step is NAMix's own: whole decibels, or tenths with Shift or Ctrl.
+constexpr double kCalWheelDb = 1.0, kCalFineWheelDb = 0.1;
+// Long enough for "-100.0", short enough that no typed number can overflow.
+constexpr size_t kEditMaxChars = 8;
 constexpr double kPi = 3.14159265358979323846;
+
+bool isFine(unsigned mods)
+{
+    return (mods & (X11PlugView::kPointerShift | X11PlugView::kPointerControl)) != 0;
+}
 
 // On-screen heights the SVG icons are rasterised at.
 constexpr int kGearH = 26;
@@ -89,6 +109,17 @@ void NamEditorView::onAttached()
     mImages.setResourceDir(res);
     mSvgs.setResourceDir(res);
     mResourcesLoaded = true;
+}
+
+// The window is going: drop an open field without applying it, and hand the
+// keyboard back while the window it was given to still exists. A drag cannot
+// outlive the editor either, so its edit gesture is closed for the host.
+void NamEditorView::onRemoved()
+{
+    cancelTextEdit();
+    if (mDragParam && mController)
+        mController->endEdit(mDragParam);
+    mDragParam = 0;
 }
 
 //------------------------------------------------------------------------
@@ -221,6 +252,10 @@ void NamEditorView::drawKnob(Canvas &c, const geo::KnobSpec &k)
     c.setFontSize(12);
     c.drawString(k.label, k.cx - c.stringWidth(k.label) / 2.0f, k.cy - geo::kKnobLabelDY);
 
+    if (editing(k.id)) {
+        drawEditField(c, knobValueRect(k), 11, k.cy + geo::kKnobValueDY);
+        return;
+    }
     const std::string val = paramText(k.id);
     if (!val.empty()) {
         const std::string disp = k.unit ? (val + " " + k.unit) : val;
@@ -228,6 +263,34 @@ void NamEditorView::drawKnob(Canvas &c, const geo::KnobSpec &k)
         c.setFontSize(11);
         c.drawString(disp.c_str(), k.cx - c.stringWidth(disp.c_str()) / 2.0f,
                      k.cy + geo::kKnobValueDY);
+    }
+}
+
+//------------------------------------------------------------------------
+// The open text field: a dark box with an azure edge, the text centred on the
+// readout's own baseline so nothing moves as the field opens, and either the
+// whole text highlighted (just opened) or a caret.
+void NamEditorView::drawEditField(Canvas &c, const Rect &r, float fontSize, float baseline)
+{
+    c.setColor(0x000000, 200);
+    c.fillRoundRect(r, 3.0f);
+    c.setColor(geo::kAzure);
+    c.setPenSize(1.0f);
+    c.strokeRoundRect(r, 3.0f);
+
+    c.setFontSize(fontSize);
+    const float textW = c.stringWidth(mEditText.c_str());
+    const float x0 = r.left() + (r.w - textW) / 2.0f;
+    if (mEditSelectAll && !mEditText.empty()) {
+        c.setColor(geo::kAzure, 110);
+        c.fillRect(Rect(x0 - 1.0f, r.top() + 3.0f, textW + 2.0f, r.h - 6.0f));
+    }
+    c.setColor(geo::kTextColor);
+    c.drawString(mEditText.c_str(), x0, baseline);
+    if (!mEditSelectAll) {
+        const std::string head = mEditText.substr(0, mEditCaret);
+        const float cx = x0 + c.stringWidth(head.c_str());
+        c.strokeLine(cx, r.top() + 3.0f, cx, r.bottom() - 3.0f);
     }
 }
 
@@ -373,6 +436,30 @@ Rect NamEditorView::outputModeRow(int i)
     const float y = 214 + i * 26;
     return Rect(312, y, 220, 22);
 }
+// 64 px wide, inside the 83 px knob pitch; 18 px tall around the readout's
+// baseline, which keeps it clear of the face above (cy + r) and of the toggle
+// pills below (cy + 74).
+Rect NamEditorView::knobValueRect(const geo::KnobSpec &k)
+{
+    return Rect(k.cx - 32.0f, k.cy + geo::kKnobValueDY - 13.0f, 64.0f, 18.0f);
+}
+
+bool NamEditorView::editFieldRect(Rect &out) const
+{
+    if (mEditParam == 0)
+        return false;
+    if (mEditParam == kInputCalibrationLevelId) {
+        out = calValueRect();
+        return true;
+    }
+    for (int i = 0; i < geo::kKnobCount; ++i) {
+        if (geo::kKnobs[i].id == mEditParam) {
+            out = knobValueRect(geo::kKnobs[i]);
+            return true;
+        }
+    }
+    return false;
+}
 
 //------------------------------------------------------------------------
 // Full-window settings overlay (matches the original layout): title + close at
@@ -408,11 +495,15 @@ void NamEditorView::drawSettings(Canvas &c)
     // "input_level_dbu", matching the original plug-in: it derives one
     // disableInputCalibrationControls flag from HasInputLevel() and applies it
     // to the Calibrate Input toggle and the level box in the same breath.
-    const std::string calText = paramText(kInputCalibrationLevelId);
-    c.setFontSize(13);
-    c.setColor(calibrateInputAvailable() ? geo::kTextColor : 0x5A5760);
-    c.drawString(calText.c_str(), val.left() + (val.w - c.stringWidth(calText.c_str())) / 2.0f,
-                 val.top() + 18);
+    if (editing(kInputCalibrationLevelId)) {
+        drawEditField(c, val, 13, val.top() + 18);
+    } else {
+        const std::string calText = paramText(kInputCalibrationLevelId);
+        c.setFontSize(13);
+        c.setColor(calibrateInputAvailable() ? geo::kTextColor : 0x5A5760);
+        c.drawString(calText.c_str(), val.left() + (val.w - c.stringWidth(calText.c_str())) / 2.0f,
+                     val.top() + 18);
+    }
 
     const Rect tog = calibrateToggleRect();
     const bool calOn = paramValue(kCalibrateInputId) > 0.5;
@@ -515,13 +606,25 @@ void NamEditorView::nudgeParam(Vst::ParamID id, double delta)
     invalidate();
 }
 
-void NamEditorView::startDrag(Vst::ParamID id, float y)
+// Double-click returns a control to its parameter's own default, as the
+// original's knobs do (IControl::OnMouseDblClick -> SetValueToDefault).
+void NamEditorView::resetParam(Vst::ParamID id)
+{
+    if (!mController)
+        return;
+    if (const Vst::Parameter *p = mController->getParameterObject(id))
+        editParam(id, p->getInfo().defaultNormalizedValue);
+    invalidate();
+}
+
+void NamEditorView::startDrag(Vst::ParamID id, float y, float range)
 {
     if (!mController)
         return;
     mDragParam = id;
-    mDragStartY = y;
-    mDragStartNorm = paramValue(id);
+    mDragLastY = y;
+    mDragRange = range > 1.0f ? range : 1.0f;
+    mDragNorm = paramValue(id);
     mController->beginEdit(id);
     // No explicit pointer grab is needed: X delivers an implicit grab to the
     // window that saw the ButtonPress for as long as the button is held, so
@@ -529,13 +632,25 @@ void NamEditorView::startDrag(Vst::ParamID id, float y)
 }
 
 //------------------------------------------------------------------------
-void NamEditorView::onMouseDown(int x, int y, int button)
+void NamEditorView::onMouseDown(int x, int y, int button, unsigned /*mods*/, bool doubleClick)
 {
     if (button != 1) // left button only, as on the original
         return;
     const float fx = static_cast<float>(x), fy = static_cast<float>(y);
     mMouseX = fx;
     mMouseY = fy;
+
+    // An open field keeps a click inside it -- and takes the keyboard back,
+    // in case the host took it away -- while a click anywhere else commits it
+    // and then goes on to do whatever it was aimed at.
+    Rect field;
+    if (editFieldRect(field)) {
+        if (field.contains(fx, fy)) {
+            setKeyboardFocus(true);
+            return;
+        }
+        commitTextEdit();
+    }
 
     // The file browser captures input while open.
     if (mBrowser.isOpen()) {
@@ -552,10 +667,14 @@ void NamEditorView::onMouseDown(int x, int y, int button)
 
     // Slim overlay captures input while open.
     if (mSlimOpen) {
-        if (hitCircle(fx, fy, geo::kSlimKnobCX, geo::kSlimKnobCY, geo::kSlimKnobR))
-            startDrag(kSlimId, fy);
-        else
+        if (hitCircle(fx, fy, geo::kSlimKnobCX, geo::kSlimKnobCY, geo::kSlimKnobR)) {
+            if (doubleClick)
+                resetParam(kSlimId);
+            else
+                startDrag(kSlimId, fy, kDragGearing * 2.0f * geo::kSlimKnobR);
+        } else {
             mSlimOpen = false; // click outside dismisses
+        }
         invalidate();
         return;
     }
@@ -581,11 +700,20 @@ void NamEditorView::onMouseDown(int x, int y, int button)
         }
     }
 
-    // Knobs: start a vertical drag.
+    // Knobs: a vertical drag on the face, a double-click on it to reset, and
+    // a click on the readout below it to type a value -- the three ways the
+    // original's IVKnobControl offers.
     for (int i = 0; i < geo::kKnobCount; ++i) {
         const geo::KnobSpec &k = geo::kKnobs[i];
         if (hitCircle(fx, fy, k.cx, k.cy, k.r)) {
-            startDrag(k.id, fy);
+            if (doubleClick)
+                resetParam(k.id);
+            else
+                startDrag(k.id, fy, kDragGearing * 2.0f * k.r);
+            return;
+        }
+        if (knobValueRect(k).contains(fx, fy)) {
+            beginTextEdit(k.id);
             return;
         }
     }
@@ -607,16 +735,24 @@ void NamEditorView::onMouseDown(int x, int y, int button)
 }
 
 //------------------------------------------------------------------------
-void NamEditorView::onMouseMove(int x, int y)
+// The drag accumulates from the last position rather than measuring from the
+// first, as the original's does, so pressing or releasing Shift mid-drag
+// changes the gearing from that point on instead of making the knob jump.
+// The accumulator is clamped too, so overshooting an end costs no travel on
+// the way back.
+void NamEditorView::onMouseMove(int x, int y, unsigned mods)
 {
     mMouseX = static_cast<float>(x);
     mMouseY = static_cast<float>(y);
     if (!mDragParam || !mController)
         return;
-    double norm = mDragStartNorm + static_cast<double>(mDragStartY - y) / kKnobDragRange;
-    norm = norm < 0.0 ? 0.0 : (norm > 1.0 ? 1.0 : norm);
-    mController->setParamNormalized(mDragParam, norm);
-    mController->performEdit(mDragParam, norm);
+    const float fy = static_cast<float>(y);
+    const float range = mDragRange * (isFine(mods) ? kFineDragFactor : 1.0f);
+    mDragNorm += static_cast<double>(mDragLastY - fy) / range;
+    mDragNorm = mDragNorm < 0.0 ? 0.0 : (mDragNorm > 1.0 ? 1.0 : mDragNorm);
+    mDragLastY = fy;
+    mController->setParamNormalized(mDragParam, mDragNorm);
+    mController->performEdit(mDragParam, mDragNorm);
     invalidate();
 }
 
@@ -632,10 +768,11 @@ void NamEditorView::onMouseUp(int /*x*/, int /*y*/, int button)
 
 //------------------------------------------------------------------------
 // Wheel adjusts whatever is under the cursor (wheel up = increase).
-void NamEditorView::onMouseWheel(int x, int y, int delta)
+void NamEditorView::onMouseWheel(int x, int y, int delta, unsigned mods)
 {
     const float fx = static_cast<float>(x), fy = static_cast<float>(y);
-    const double step = delta * 0.05;
+    const bool fine = isFine(mods);
+    const double step = delta * (fine ? kFineWheelStep : kWheelStep);
 
     if (mBrowser.isOpen()) {
         if (mBrowser.handleWheel(delta))
@@ -648,8 +785,11 @@ void NamEditorView::onMouseWheel(int x, int y, int delta)
         return;
     }
     if (mSettingsOpen) {
-        if (calibrateInputAvailable() && calValueRect().contains(fx, fy))
-            nudgeParam(kInputCalibrationLevelId, step);
+        if (calibrateInputAvailable() && calValueRect().contains(fx, fy) &&
+            !editing(kInputCalibrationLevelId)) {
+            const double db = delta * (fine ? kCalFineWheelDb : kCalWheelDb);
+            nudgeParam(kInputCalibrationLevelId, db / (ranges::kCalMax - ranges::kCalMin));
+        }
         return;
     }
     for (int i = 0; i < geo::kKnobCount; ++i) {
@@ -687,9 +827,200 @@ void NamEditorView::handleSettingsClick(float x, float y)
             invalidate();
             return;
         }
+        // Typed, as the original's InputLevelControl is: an interface level
+        // is read off a spec sheet and entered, not found by feel.
         if (calValueRect().contains(x, y))
-            startDrag(kInputCalibrationLevelId, y); // drag to edit dBu
+            beginTextEdit(kInputCalibrationLevelId);
     }
+}
+
+//------------------------------------------------------------------------
+// Typed values
+//------------------------------------------------------------------------
+void NamEditorView::beginTextEdit(Vst::ParamID id)
+{
+    if (!mController || id == 0 || editing(id))
+        return;
+    commitTextEdit();
+    mEditParam = id;
+    // Seeded with the value as the readout shows it, without the unit, and
+    // selected, so typing replaces it and the arrow keys keep it to adjust.
+    mEditText = paramText(id);
+    if (mEditText.size() > kEditMaxChars)
+        mEditText.resize(kEditMaxChars);
+    mEditCaret = mEditText.size();
+    mEditSelectAll = true;
+    // Held for exactly as long as the field is open: every exit from it runs
+    // through commitTextEdit() or cancelTextEdit(), which hand it back.
+    setKeyboardFocus(true);
+    invalidate();
+}
+
+void NamEditorView::commitTextEdit()
+{
+    if (mEditParam == 0)
+        return;
+    const Vst::ParamID id = mEditParam;
+    std::string text = mEditText;
+    cancelTextEdit();
+    if (!mController)
+        return;
+
+    // Parsed here rather than by Parameter::fromString, whose sscanf("%lf")
+    // follows the host's LC_NUMERIC: under a locale that writes 2,5 it would
+    // read "2.5" as 2. std::from_chars ignores the locale, and both decimal
+    // marks are accepted so either habit works. from_chars takes no leading
+    // '+', so one is dropped first.
+    std::replace(text.begin(), text.end(), ',', '.');
+    const char *begin = text.c_str();
+    if (*begin == '+')
+        ++begin;
+    double plain = 0.0;
+    const std::from_chars_result r = std::from_chars(begin, text.c_str() + text.size(), plain);
+    // Text that is not a number -- an emptied field, a lone "-" -- is a user
+    // part-way through an edit, not a request for the minimum, so the
+    // parameter keeps its value.
+    if (r.ec != std::errc() || r.ptr == begin)
+        return;
+    Vst::Parameter *p = mController->getParameterObject(id);
+    if (!p)
+        return;
+    // Clamped rather than refused: the readout redraws at the limit, which
+    // says what was set. No isfinite() check is needed (and under this
+    // target's -ffast-math it would fold away): only [0-9.,+-] can be typed,
+    // at most kEditMaxChars of them, so the value is always finite.
+    const double lo = p->toPlain(0.0), hi = p->toPlain(1.0);
+    plain = std::clamp(plain, std::min(lo, hi), std::max(lo, hi));
+    editParam(id, p->toNormalized(plain));
+    invalidate();
+}
+
+void NamEditorView::cancelTextEdit()
+{
+    if (mEditParam == 0)
+        return;
+    mEditParam = 0;
+    mEditText.clear();
+    mEditCaret = 0;
+    mEditSelectAll = false;
+    setKeyboardFocus(false);
+    invalidate();
+}
+
+// One key. Returns whether it was consumed, which is the whole contract: the
+// SDK warns that answering kResultTrue for a key that was not handled blocks
+// the host's own key commands, and in a DAW the space bar is one of those.
+bool NamEditorView::handleTextKey(char16 key, int16 keyCode, int16 modifiers)
+{
+    if (mEditParam == 0)
+        return false;
+
+    switch (keyCode) {
+        case KEY_RETURN:
+        case KEY_ENTER:
+        case KEY_TAB:
+            commitTextEdit();
+            return true;
+        case KEY_ESCAPE:
+            cancelTextEdit();
+            return true;
+        case KEY_BACK:
+            if (mEditSelectAll) {
+                mEditSelectAll = false;
+                mEditText.clear();
+                mEditCaret = 0;
+            } else if (mEditCaret > 0) {
+                mEditText.erase(--mEditCaret, 1);
+            }
+            invalidate();
+            return true;
+        case KEY_DELETE:
+            if (mEditSelectAll) {
+                mEditSelectAll = false;
+                mEditText.clear();
+                mEditCaret = 0;
+            } else if (mEditCaret < mEditText.size()) {
+                mEditText.erase(mEditCaret, 1);
+            }
+            invalidate();
+            return true;
+        // Moving the caret says "edit this rather than replace it": the
+        // selection drops, the text stays, and the caret lands at the end the
+        // arrow points at.
+        case KEY_LEFT:
+            if (mEditSelectAll)
+                mEditCaret = 0;
+            else if (mEditCaret > 0)
+                --mEditCaret;
+            mEditSelectAll = false;
+            invalidate();
+            return true;
+        case KEY_RIGHT:
+            if (mEditSelectAll)
+                mEditCaret = mEditText.size();
+            else if (mEditCaret < mEditText.size())
+                ++mEditCaret;
+            mEditSelectAll = false;
+            invalidate();
+            return true;
+        case KEY_HOME:
+            mEditSelectAll = false;
+            mEditCaret = 0;
+            invalidate();
+            return true;
+        case KEY_END:
+            mEditSelectAll = false;
+            mEditCaret = mEditText.size();
+            invalidate();
+            return true;
+        default:
+            break;
+    }
+
+    // Shift is part of typing (it is set for '+' on most layouts); only the
+    // command modifiers are refused, so Ctrl-S still reaches the host.
+    const int16 kCommandMods = static_cast<int16>(kAlternateKey | kCommandKey | kControlKey);
+    if ((modifiers & kCommandMods) != 0)
+        return false;
+
+    char16 ch = key;
+    // For a host that fills in only the virtual code: keycodes.h encodes the
+    // digits as '0' + VKEY_FIRST_ASCII, and VirtualKeyCodeToChar undoes it.
+    if ((ch < 0x20 || ch > 0x7E) && keyCode >= VKEY_FIRST_ASCII)
+        ch = static_cast<char16>(VirtualKeyCodeToChar(static_cast<uint8>(keyCode)));
+    if (ch < 0x20 || ch > 0x7E)
+        return false;
+    // Consumed either way from here: the field has the keyboard, so a
+    // character it will not take must still not reach the host's commands.
+    const bool numeric =
+        (ch >= '0' && ch <= '9') || ch == '.' || ch == ',' || ch == '-' || ch == '+';
+    if (!numeric)
+        return true;
+    if (mEditSelectAll) {
+        mEditSelectAll = false;
+        mEditText.clear();
+        mEditCaret = 0;
+    }
+    if (mEditText.size() >= kEditMaxChars)
+        return true;
+    mEditText.insert(mEditCaret, 1, static_cast<char>(ch));
+    ++mEditCaret;
+    invalidate();
+    return true;
+}
+
+// The SDK's route: a host that passes keys to the view lands here, and one
+// that does not reaches handleTextKey through onKeyDownNative instead. Only
+// one of them can carry a given key -- while the editor holds the X focus the
+// host never sees it -- so a key is never handled twice.
+tresult PLUGIN_API NamEditorView::onKeyDown(char16 key, int16 keyCode, int16 modifiers)
+{
+    return handleTextKey(key, keyCode, modifiers) ? kResultTrue : kResultFalse;
+}
+
+bool NamEditorView::onKeyDownNative(char16 key, int16 keyCode, int16 modifiers)
+{
+    return handleTextKey(key, keyCode, modifiers);
 }
 
 //------------------------------------------------------------------------
@@ -888,6 +1219,10 @@ void NamEditorView::ModelCapsChanged()
     // publishes each edit as it is made.
     if (mSlimOpen && !slimAvailable())
         mSlimOpen = false;
+    // Likewise the dBu box, which a capture without "input_level_dbu"
+    // disables: a value typed for it must not land after it has gone.
+    if (editing(kInputCalibrationLevelId) && !calibrateInputAvailable())
+        cancelTextEdit();
     invalidate();
 }
 

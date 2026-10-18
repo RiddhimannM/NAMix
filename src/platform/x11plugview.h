@@ -50,6 +50,13 @@ public:
     X11PlugView(Vst::EditController *controller, ViewRect *size = nullptr);
     ~X11PlugView() override;
 
+    // Modifier keys held during a pointer event, as a mask of these bits.
+    // Only the two a fine-adjust gesture needs are carried.
+    enum PointerMod : unsigned {
+        kPointerShift = 1u << 0,   // ShiftMask
+        kPointerControl = 1u << 1, // ControlMask
+    };
+
     //---from CPluginView-------------
     tresult PLUGIN_API isPlatformTypeSupported(FIDString type) SMTG_OVERRIDE;
     tresult PLUGIN_API attached(void *parent, FIDString type) SMTG_OVERRIDE;
@@ -86,26 +93,48 @@ protected:
     virtual void onDraw(cairo_t *cr) = 0;
 
     // Pointer input. Buttons are X button numbers (1 = left, 2 = middle,
-    // 3 = right). Wheel steps arrive as delta +1 (up) or -1 (down).
-    virtual void onMouseDown(int x, int y, int button)
+    // 3 = right). Wheel steps arrive as delta +1 (up) or -1 (down). `mods`
+    // is a PointerMod mask. `doubleClick` is set on the second press of the
+    // same button, close in time and place to the first: X has no
+    // double-click event of its own, so it is derived here once rather than
+    // by every editor.
+    virtual void onMouseDown(int x, int y, int button, unsigned mods, bool doubleClick)
     {
-        (void)x, (void)y, (void)button;
+        (void)x, (void)y, (void)button, (void)mods, (void)doubleClick;
     }
     virtual void onMouseUp(int x, int y, int button)
     {
         (void)x, (void)y, (void)button;
     }
-    virtual void onMouseMove(int x, int y)
+    virtual void onMouseMove(int x, int y, unsigned mods)
     {
-        (void)x, (void)y;
+        (void)x, (void)y, (void)mods;
     }
     virtual void onMouseLeave()
     {
     }
-    virtual void onMouseWheel(int x, int y, int delta)
+    virtual void onMouseWheel(int x, int y, int delta, unsigned mods)
     {
-        (void)x, (void)y, (void)delta;
+        (void)x, (void)y, (void)delta, (void)mods;
     }
+
+    // Keyboard, taken from the PLATFORM window rather than handed in by the
+    // host. Return true if the key was consumed. See setKeyboardFocus() in the
+    // .cpp for why this exists alongside IPlugView::onKeyDown. The three
+    // arguments are IPlugView::onKeyDown's own -- `key` an ASCII character or
+    // 0, `keyCode` a VirtualKeyCodes value from pluginterfaces/base/keycodes.h
+    // or 0, `modifiers` a KeyModifier mask -- so a subclass can route both to
+    // one handler.
+    virtual bool onKeyDownNative(char16 key, int16 keyCode, int16 modifiers)
+    {
+        (void)key, (void)keyCode, (void)modifiers;
+        return false;
+    }
+
+    // Take the X input focus, or hand it straight back to whoever had it.
+    // Called by the editor around a text field, and never held for longer
+    // than one is open -- see the .cpp.
+    void setKeyboardFocus(bool wanted);
 
     // ~30 Hz, immediately before a repaint is considered. Animation (meter
     // decay) belongs here.
@@ -169,6 +198,20 @@ private:
     bool mDirty = true;
     bool mMapped = false;
     int mTicksUnmapped = 0;
+
+    // The last left/middle/right press, for double-click detection. Time is
+    // the X server's millisecond clock from the event itself, never the
+    // local clock, so a slow round trip cannot turn one click into two.
+    unsigned int mLastPressButton = 0;
+    unsigned long mLastPressTime = 0;
+    int mLastPressX = 0, mLastPressY = 0;
+
+    // Keyboard focus, held only while a text field is open. mPrevFocus is
+    // whatever had the focus when we took it, so it can be given back rather
+    // than left wherever we put it.
+    bool mKeyFocus = false;
+    ::Window mPrevFocus = None;
+    int mPrevRevert = RevertToParent;
 
     bool mTrace = false;
     unsigned long mTickCount = 0;

@@ -2,12 +2,16 @@
 
 #include "x11plugview.h"
 
+#include "pluginterfaces/base/keycodes.h"
+
 #include <cairo/cairo-xlib.h>
 
 #include <X11/Xutil.h>
+#include <X11/keysym.h>
 
 #include <atomic>
 #include <cstdarg>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -40,6 +44,61 @@ constexpr int kMapFallbackTicks = 6; // ~200 ms at 33 ms
 // something woke it up).
 constexpr unsigned long kSummaryTicks = 30;
 constexpr unsigned long kQuietRedrawTicks = 15;
+
+// Two presses of one button count as a double-click when the second follows
+// within this many milliseconds and this many pixels of the first. X itself
+// defines no double-click, so these are this editor's own choice, not a
+// value read from the desktop's settings.
+constexpr unsigned long kDoubleClickMs = 400;
+constexpr int kDoubleClickSlop = 4;
+
+unsigned pointerMods(unsigned int state)
+{
+    unsigned mods = 0;
+    if (state & ShiftMask)
+        mods |= X11PlugView::kPointerShift;
+    if (state & ControlMask)
+        mods |= X11PlugView::kPointerControl;
+    return mods;
+}
+
+//------------------------------------------------------------------------
+// One X keysym to one VirtualKeyCodes value (pluginterfaces/base/keycodes.h),
+// or 0 for a key that has no virtual code and is therefore carried by its
+// character instead. Only the keys a text field needs are mapped: the point of
+// this table is editing, not a general key API.
+int16 virtualKeyFromKeySym(KeySym sym)
+{
+    switch (sym) {
+        case XK_BackSpace:
+            return KEY_BACK;
+        case XK_Tab:
+            return KEY_TAB;
+        case XK_Return:
+            return KEY_RETURN;
+        case XK_KP_Enter:
+            return KEY_ENTER;
+        case XK_Escape:
+            return KEY_ESCAPE;
+        case XK_Delete:
+        case XK_KP_Delete:
+            return KEY_DELETE;
+        case XK_Left:
+        case XK_KP_Left:
+            return KEY_LEFT;
+        case XK_Right:
+        case XK_KP_Right:
+            return KEY_RIGHT;
+        case XK_Home:
+        case XK_KP_Home:
+            return KEY_HOME;
+        case XK_End:
+        case XK_KP_End:
+            return KEY_END;
+        default:
+            return 0;
+    }
+}
 
 //------------------------------------------------------------------------
 // Non-fatal X error handling.
@@ -383,8 +442,15 @@ bool X11PlugView::openWindow(::Window parent)
     attrs.background_pixmap = None; // we paint every pixel ourselves
     attrs.border_pixel = 0;         // required whenever our depth differs from the parent's
     attrs.colormap = colormap;
+    // KeyPressMask departs from the SDK, which says a view "must not handle
+    // keyboard events by the means of platform callbacks, but let the host
+    // pass them to the view" (iplugview.h). Selecting the mask costs nothing
+    // on its own: X delivers a key to this window only while it holds the
+    // input focus, and focus is taken only while a text field is open (see
+    // setKeyboardFocus). At every other moment keys reach the host exactly as
+    // before, so its key commands are untouched.
     attrs.event_mask = ExposureMask | ButtonPressMask | ButtonReleaseMask | PointerMotionMask |
-                       LeaveWindowMask | StructureNotifyMask | PropertyChangeMask;
+                       LeaveWindowMask | StructureNotifyMask | PropertyChangeMask | KeyPressMask;
 
     const unsigned long errorsBefore = gErrorCount.load();
     mWindow = XCreateWindow(mDisplay, parent, 0, 0, width, height, 0, depth, InputOutput, visual,
@@ -441,8 +507,87 @@ bool X11PlugView::openWindow(::Window parent)
 }
 
 //------------------------------------------------------------------------
+// Take the X input focus for this window, or give it straight back.
+//
+// This departs from the SDK on purpose. iplugview.h says a view "must not
+// handle keyboard events by the means of platform callbacks, but let the host
+// pass them to the view", and the editor does implement IPlugView::onKeyDown
+// for that route. But whether a host routes keys to an embedded view at all is
+// the host's policy, and on Linux many do not: the SDK's own editorhost
+// selects KeyPressMask on its window and never calls onKeyDown anywhere in its
+// source. A text field that cannot be typed into is not a field.
+//
+// What the SDK rule protects is the host's key commands, and that is kept:
+// focus is taken only while a text field is open, and handed back to whoever
+// held it the moment the field closes. onKeyDown stays implemented, so a host
+// that does route keys keeps working unchanged.
+//
+// Who holds the focus is asked of the server each time rather than tracked
+// from FocusIn/FocusOut. Those events do not say what they seem to: taking the
+// focus from the host's container was traced (NAMIX_X11_TRACE) sending this
+// window a FocusOut immediately before its FocusIn, and treating that as a
+// loss meant the focus was never handed back.
+void X11PlugView::setKeyboardFocus(bool wanted)
+{
+    if (!mDisplay || !mWindow)
+        return;
+    ::Window current = None;
+    int currentRevert = RevertToParent;
+    XGetInputFocus(mDisplay, &current, &currentRevert);
+
+    if (wanted) {
+        if (mKeyFocus && current == mWindow)
+            return; // already ours
+        // XSetInputFocus on a window that is not viewable is a BadMatch, and
+        // an unmapped editor is an ordinary state here (see ensureMapped).
+        XWindowAttributes attrs;
+        if (XGetWindowAttributes(mDisplay, mWindow, &attrs) == 0 || attrs.map_state != IsViewable)
+            return;
+        // Whatever held the focus just before this is what gets it back. A
+        // re-take, after the host or window manager moved the focus away from
+        // an open field, remembers where it was moved to.
+        if (current != mWindow) {
+            mPrevFocus = current;
+            mPrevRevert = currentRevert;
+        }
+        XSetInputFocus(mDisplay, mWindow, RevertToParent, CurrentTime);
+        XFlush(mDisplay);
+        mKeyFocus = true;
+        trace("keyboard focus taken, previous=0x%lx", mPrevFocus);
+        return;
+    }
+
+    if (!mKeyFocus)
+        return;
+    mKeyFocus = false;
+    const ::Window prev = mPrevFocus;
+    mPrevFocus = None;
+    // Hand back only what is still ours. If the host or window manager has
+    // moved the focus since, it is not this editor's to move again.
+    if (current != mWindow) {
+        trace("keyboard focus already moved to 0x%lx; nothing to release", current);
+        return;
+    }
+    // PointerRoot and None are legal focus values in their own right and are
+    // handed back as they are; a real window may have been destroyed while we
+    // held the focus, so it is probed first rather than trusted.
+    if (prev == PointerRoot || prev == None) {
+        XSetInputFocus(mDisplay, prev, mPrevRevert, CurrentTime);
+    } else if (prev != mWindow) {
+        XWindowAttributes attrs;
+        if (XGetWindowAttributes(mDisplay, prev, &attrs) != 0)
+            XSetInputFocus(mDisplay, prev, mPrevRevert, CurrentTime);
+    }
+    XFlush(mDisplay);
+    trace("keyboard focus released to 0x%lx", prev);
+}
+
+//------------------------------------------------------------------------
 void X11PlugView::closeWindow()
 {
+    // Never leave the focus pointed at a window that is about to stop existing.
+    setKeyboardFocus(false);
+
     if (mBuffer) {
         cairo_surface_destroy(mBuffer);
         mBuffer = nullptr;
@@ -576,15 +721,30 @@ void X11PlugView::drainEvents()
                     mDirty = true;
                 break;
 
-            case ButtonPress:
-                if (event.xbutton.button == kWheelUp || event.xbutton.button == kWheelDown) {
-                    onMouseWheel(event.xbutton.x, event.xbutton.y,
-                                 event.xbutton.button == kWheelUp ? 1 : -1);
-                } else {
-                    onMouseDown(event.xbutton.x, event.xbutton.y,
-                                static_cast<int>(event.xbutton.button));
+            case ButtonPress: {
+                const XButtonEvent &b = event.xbutton;
+                if (b.button == kWheelUp || b.button == kWheelDown) {
+                    onMouseWheel(b.x, b.y, b.button == kWheelUp ? 1 : -1, pointerMods(b.state));
+                    break;
                 }
+                // The server clock is a 32-bit CARD32 carried in an unsigned
+                // long, so the difference is taken in 32 bits to stay right
+                // across its wrap.
+                const bool doubleClick =
+                    b.button == mLastPressButton &&
+                    static_cast<uint32_t>(b.time - mLastPressTime) <= kDoubleClickMs &&
+                    std::abs(b.x - mLastPressX) <= kDoubleClickSlop &&
+                    std::abs(b.y - mLastPressY) <= kDoubleClickSlop;
+                // A double-click consumes its pair, so a third press starts a
+                // new one instead of reading as a second double-click.
+                mLastPressButton = doubleClick ? 0 : b.button;
+                mLastPressTime = b.time;
+                mLastPressX = b.x;
+                mLastPressY = b.y;
+                onMouseDown(b.x, b.y, static_cast<int>(b.button), pointerMods(b.state),
+                            doubleClick);
                 break;
+            }
 
             case ButtonRelease:
                 if (event.xbutton.button != kWheelUp && event.xbutton.button != kWheelDown)
@@ -603,13 +763,42 @@ void X11PlugView::drainEvents()
                         break;
                     XNextEvent(mDisplay, &latest);
                 }
-                onMouseMove(latest.xmotion.x, latest.xmotion.y);
+                onMouseMove(latest.xmotion.x, latest.xmotion.y, pointerMods(latest.xmotion.state));
                 break;
             }
 
             case LeaveNotify:
                 onMouseLeave();
                 break;
+
+            case KeyPress: {
+                // XLookupString applies the shift and lock state and yields
+                // the Latin-1 byte. Only ASCII is passed on: the fields this
+                // feeds take numbers, and a multi-byte answer is a character
+                // none of them could store.
+                XKeyEvent ke = event.xkey;
+                char text[8] = {0};
+                KeySym sym = NoSymbol;
+                const int n = XLookupString(&ke, text, sizeof(text) - 1, &sym, nullptr);
+                const unsigned char byte = (n >= 1) ? static_cast<unsigned char>(text[0]) : 0;
+                const char16 ch = (byte >= 0x20 && byte < 0x7F) ? static_cast<char16>(byte) : 0;
+                // KeyModifier's own mapping (pluginterfaces/base/keycodes.h):
+                // kCommandKey is "Windows: ctrl key" and kControlKey is
+                // "Windows: win key", so ControlMask is kCommandKey here and
+                // Mod4 (Super) is kControlKey.
+                int16 mods = 0;
+                if (ke.state & ShiftMask)
+                    mods |= kShiftKey;
+                if (ke.state & ControlMask)
+                    mods |= kCommandKey;
+                if (ke.state & Mod1Mask)
+                    mods |= kAlternateKey;
+                if (ke.state & Mod4Mask)
+                    mods |= kControlKey;
+                if (onKeyDownNative(ch, virtualKeyFromKeySym(sym), mods))
+                    mDirty = true;
+                break;
+            }
 
             case MapNotify:
                 mMapped = true;

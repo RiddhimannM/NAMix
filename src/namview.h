@@ -46,13 +46,20 @@ public:
     void ModelCapsChanged();
 
 protected:
+    //---from IPlugView---------------
+    Steinberg::tresult PLUGIN_API onKeyDown(Steinberg::char16 key, Steinberg::int16 keyCode,
+                                            Steinberg::int16 modifiers) SMTG_OVERRIDE;
+
     //---from X11PlugView-------------
     void onAttached() SMTG_OVERRIDE;
+    void onRemoved() SMTG_OVERRIDE;
     void onDraw(cairo_t *cr) SMTG_OVERRIDE;
-    void onMouseDown(int x, int y, int button) SMTG_OVERRIDE;
+    void onMouseDown(int x, int y, int button, unsigned mods, bool doubleClick) SMTG_OVERRIDE;
     void onMouseUp(int x, int y, int button) SMTG_OVERRIDE;
-    void onMouseMove(int x, int y) SMTG_OVERRIDE;
-    void onMouseWheel(int x, int y, int delta) SMTG_OVERRIDE;
+    void onMouseMove(int x, int y, unsigned mods) SMTG_OVERRIDE;
+    void onMouseWheel(int x, int y, int delta, unsigned mods) SMTG_OVERRIDE;
+    bool onKeyDownNative(Steinberg::char16 key, Steinberg::int16 keyCode,
+                         Steinberg::int16 modifiers) SMTG_OVERRIDE;
     void onTick() SMTG_OVERRIDE;
 
 private:
@@ -69,11 +76,13 @@ private:
     void dimPanel(Canvas &c);
     void drawSettings(Canvas &c);
     void drawSlimOverlay(Canvas &c);
+    void drawEditField(Canvas &c, const Rect &r, float fontSize, float baseline);
 
     //--- interaction -----------------------------------------------------
     void editParam(Steinberg::Vst::ParamID id, double norm);
     void nudgeParam(Steinberg::Vst::ParamID id, double delta);
-    void startDrag(Steinberg::Vst::ParamID id, float y);
+    void resetParam(Steinberg::Vst::ParamID id);
+    void startDrag(Steinberg::Vst::ParamID id, float y, float range);
     void handleSettingsClick(float x, float y);
     bool handleFileRowClick(const geo::FileRow &row, float x, float y, bool model);
     void cycleFile(bool model, int dir);
@@ -91,6 +100,27 @@ private:
     static Rect calValueRect();
     static Rect calibrateToggleRect();
     static Rect outputModeRow(int i);
+    // The value readout under a knob, which is also where its value is typed.
+    static Rect knobValueRect(const geo::KnobSpec &k);
+    // Where the open text field is, if one is.
+    bool editFieldRect(Rect &out) const;
+
+    //--- typed values ----------------------------------------------------
+    // One field at a time, editing the plain value of one parameter: a knob's
+    // readout or the dBu calibration level. Typing is a second way to reach
+    // each of them, never the only one -- whether keys reach an embedded view
+    // at all is up to the host, so dragging and the wheel keep working
+    // wherever typing cannot.
+    void beginTextEdit(Steinberg::Vst::ParamID id);
+    // Keeps what was typed, which is what every exit but Escape does. Text
+    // that does not parse as a number leaves the parameter alone.
+    void commitTextEdit();
+    void cancelTextEdit();
+    bool handleTextKey(Steinberg::char16 key, Steinberg::int16 keyCode, Steinberg::int16 modifiers);
+    bool editing(Steinberg::Vst::ParamID id) const
+    {
+        return mEditParam != 0 && mEditParam == id;
+    }
 
     NamController *mController = nullptr;
 
@@ -103,9 +133,17 @@ private:
     bool mBrowserForModel = true;
 
     Steinberg::Vst::ParamID mDragParam = 0; // 0 = no active drag
-    float mDragStartY = 0;
-    double mDragStartNorm = 0;
+    float mDragLastY = 0;
+    float mDragRange = 1; // pixels of vertical travel for the full range
+    double mDragNorm = 0; // accumulated, so the gearing can change mid-drag
     float mMouseX = 0, mMouseY = 0;
+
+    Steinberg::Vst::ParamID mEditParam = 0; // 0 = no text field open
+    std::string mEditText;
+    size_t mEditCaret = 0;
+    // The seed is selected as the field opens, so the first character typed
+    // replaces it rather than being appended to the old value.
+    bool mEditSelectAll = false;
 
     float mInDisp = 0, mOutDisp = 0;
 
